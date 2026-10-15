@@ -161,7 +161,7 @@ class App : ApplicationContext
         autoItem.Checked = autoPause;
         menu.Items.Add(autoItem);
 
-        rendererMenu = new ToolStripMenuItem("Renderer (try if nothing shows)");
+        rendererMenu = new ToolStripMenuItem("Renderer");
         foreach (string rn in new string[] { "", "software", "direct3d11", "direct3d", "opengl" })
         {
             string name = rn;
