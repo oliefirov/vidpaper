@@ -63,7 +63,7 @@ ffmpeg -i input.webm -vf "scale=1920:1080:force_original_aspect_ratio=increase,c
 
 ## Status and limitations
 
-- Tested on a Windows 11 desktop with the newer (24H2+) layout. The classic Windows 10 / early Windows 11 code path is implemented but less tested, so reports are welcome.
+- Tested on Windows 11(24H2+) and Windows 10.
 - Primary monitor only.
 - No audio.
 - Wallpaper changes made through Windows Settings are not touched; exiting VidPaper brings your normal wallpaper back.
