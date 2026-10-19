@@ -30,6 +30,7 @@ static class Native
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool SystemParametersInfo(uint action, uint param, string data, uint flags);
     [DllImport("ntdll.dll")] public static extern int NtSuspendProcess(IntPtr h);
     [DllImport("ntdll.dll")] public static extern int NtResumeProcess(IntPtr h);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
 
@@ -161,7 +162,7 @@ class App : ApplicationContext
         autoItem.Checked = autoPause;
         menu.Items.Add(autoItem);
 
-        rendererMenu = new ToolStripMenuItem("Renderer");
+        rendererMenu = new ToolStripMenuItem("Renderer (try if nothing shows)");
         foreach (string rn in new string[] { "", "software", "direct3d11", "direct3d", "opengl" })
         {
             string name = rn;
@@ -192,7 +193,7 @@ class App : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, delegate { Quit(); });
 
-        tray.Icon = SystemIcons.Application;
+        tray.Icon = LoadTrayIcon();
         tray.Text = "VidPaper";
         tray.ContextMenuStrip = menu;
         tray.DoubleClick += delegate { Choose(); };
@@ -208,6 +209,18 @@ class App : ApplicationContext
         try { if (File.Exists(configFile)) saved = File.ReadAllText(configFile).Trim(); } catch { }
         if (!string.IsNullOrEmpty(saved) && File.Exists(saved)) Play(saved);
         else Choose();
+    }
+
+    static Icon LoadTrayIcon()
+    {
+        try
+        {
+            IntPtr[] small = new IntPtr[1];
+            if (Native.ExtractIconEx(Application.ExecutablePath, 0, null, small, 1) > 0 && small[0] != IntPtr.Zero)
+                return Icon.FromHandle(small[0]);
+        }
+        catch { }
+        return SystemIcons.Application;
     }
 
     string GetSetting(string key, string def)
