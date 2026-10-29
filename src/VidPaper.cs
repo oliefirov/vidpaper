@@ -28,8 +28,6 @@ static class Native
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool SystemParametersInfo(uint action, uint param, string data, uint flags);
-    [DllImport("ntdll.dll")] public static extern int NtSuspendProcess(IntPtr h);
-    [DllImport("ntdll.dll")] public static extern int NtResumeProcess(IntPtr h);
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
@@ -65,8 +63,22 @@ static class Program
 
             Native.SetProcessDPIAware();
             Application.EnableVisualStyles();
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e) { CrashLog(e.Exception); };
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { CrashLog(e.ExceptionObject); };
             Application.Run(new App(ffplay));
         }
+    }
+
+    static void CrashLog(object ex)
+    {
+        try
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VidPaper");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "log.txt"), DateTime.Now.ToString("HH:mm:ss.fff") + "  CRASH: " + ex + "\r\n");
+        }
+        catch { }
     }
 
     static string FindFfplay()
@@ -108,11 +120,11 @@ class App : ApplicationContext
     string renderer = "";
     bool autoPause = true, postLogged;
     int ffLines;
-    DateTime attachedAt;
+    DateTime attachedAt, stoppedAt;
 
     Process proc;
     string video;
-    bool attached, suspended, userPaused, alt;
+    bool attached, userPaused, alt;
     int tries, fails, activeMode;
     IntPtr playerWnd, progmanWnd, defViewWnd;
 
@@ -124,8 +136,8 @@ class App : ApplicationContext
         configFile = Path.Combine(dir, "video.txt");
         settingsFile = Path.Combine(dir, "settings.ini");
         logFile = Path.Combine(dir, "log.txt");
-        try { File.WriteAllText(logFile, ""); } catch { }
-        Log("VidPaper started. ffplay: " + ffplay);
+        try { if (File.Exists(logFile) && new FileInfo(logFile).Length > 200000) File.WriteAllText(logFile, ""); } catch { }
+        Log("---- VidPaper started. ffplay: " + ffplay);
 
         alt = GetSetting("alt", "0") == "1";
         autoPause = GetSetting("autopause", "1") == "1";
@@ -133,11 +145,11 @@ class App : ApplicationContext
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("Choose video...", null, delegate { Choose(); });
-        pauseItem = new ToolStripMenuItem("Pause", null, delegate
+        pauseItem = new ToolStripMenuItem("Pause (show normal wallpaper)", null, delegate
         {
             userPaused = !userPaused;
             pauseItem.Checked = userPaused;
-            ApplyPause();
+            Watch(null, null);
         });
         menu.Items.Add(pauseItem);
         altItem = new ToolStripMenuItem("Alternate desktop mode (try if nothing shows)", null, delegate
@@ -157,7 +169,7 @@ class App : ApplicationContext
             autoItem.Checked = autoPause;
             SetSetting("autopause", autoPause ? "1" : "0");
             Log("Auto-pause = " + autoPause);
-            ApplyPause();
+            Watch(null, null);
         });
         autoItem.Checked = autoPause;
         menu.Items.Add(autoItem);
@@ -201,7 +213,7 @@ class App : ApplicationContext
 
         attachTimer.Interval = 100;
         attachTimer.Tick += TryAttach;
-        watchTimer.Interval = 1500;
+        watchTimer.Interval = 1000;
         watchTimer.Tick += Watch;
         watchTimer.Start();
 
@@ -296,10 +308,11 @@ class App : ApplicationContext
         Kill();
         if (!File.Exists(path)) { Log("File not found: " + path); return; }
         video = path;
+        if (IsPaused()) { Log("Paused: ffplay will start when playback resumes"); return; }
 
         Rectangle b = Screen.PrimaryScreen.Bounds;
         string args = string.Format(
-            "-loglevel warning -nostats -an -sn -noborder -loop 0 -framedrop " +
+            "-loglevel warning -nostats -an -sn -noborder -loop 0 -framedrop -left 30000 -top 30000 " +
             "-x {0} -y {1} -window_title {2} " +
             "-vf \"scale={0}:{1}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop={0}:{1}\" -i \"{3}\"",
             b.Width, b.Height, Title, path);
@@ -330,7 +343,6 @@ class App : ApplicationContext
             return;
         }
         attached = false;
-        suspended = false;
         tries = 0;
         attachTimer.Start();
     }
@@ -339,7 +351,6 @@ class App : ApplicationContext
     {
         attachTimer.Stop();
         attached = false;
-        suspended = false;
         playerWnd = IntPtr.Zero;
         try { if (proc != null && !proc.HasExited) proc.Kill(); } catch { }
         proc = null;
@@ -369,7 +380,6 @@ class App : ApplicationContext
         attachedAt = DateTime.Now;
         postLogged = false;
         fails = 0;
-        ApplyPause();
     }
 
     void AttachToDesktop(IntPtr hw)
@@ -410,13 +420,14 @@ class App : ApplicationContext
             if (host == IntPtr.Zero) host = progman;
             Native.SetParent(hw, host);
             SetChildStyle(hw);
+            Native.SetWindowLong(hw, -20, Native.GetWindowLong(hw, -20) | 0x08000000 | 0x00000080);
             Native.SetWindowPos(hw, HWND_BOTTOM, x, y, b.Width, b.Height, 0x0010 | 0x0040 | 0x0020);
         }
         else
         {
             SetChildStyle(hw);
             int ex = Native.GetWindowLong(hw, -20);
-            Native.SetWindowLong(hw, -20, ex | 0x00080000);
+            Native.SetWindowLong(hw, -20, ex | 0x00080000 | 0x00000020 | 0x08000000 | 0x00000080);
             Native.SetLayeredWindowAttributes(hw, 0, 255, 2);
             Native.SetParent(hw, progman);
             ZFix(progman, defView, hw);
@@ -460,12 +471,38 @@ class App : ApplicationContext
         return false;
     }
 
+    bool IsPaused()
+    {
+        return userPaused || (autoPause && DesktopCovered());
+    }
+
     void Watch(object sender, EventArgs e)
     {
-        if (video != null && (proc == null || proc.HasExited))
+        if (video == null) return;
+
+        if (IsPaused())
+        {
+            if (proc != null)
+            {
+                Log("Paused: stopping ffplay (foreground class: " + Native.ClassOf(Native.GetForegroundWindow()) + ")");
+                Kill();
+                stoppedAt = DateTime.Now;
+            }
+            return;
+        }
+
+        if (proc == null)
+        {
+            if ((DateTime.Now - stoppedAt).TotalSeconds < 2) return;
+            Log("Resumed: starting ffplay");
+            Play(video);
+            return;
+        }
+
+        if (proc.HasExited)
         {
             int code = -1;
-            try { if (proc != null) code = proc.ExitCode; } catch { }
+            try { code = proc.ExitCode; } catch { }
             Log("ffplay is not running (exit code " + code + "), attempt " + (fails + 1));
             if (++fails <= 3) Play(video);
             else
@@ -475,6 +512,7 @@ class App : ApplicationContext
             }
             return;
         }
+
         if (attached && !postLogged && (DateTime.Now - attachedAt).TotalSeconds >= 3 && playerWnd != IntPtr.Zero)
         {
             postLogged = true;
@@ -482,31 +520,16 @@ class App : ApplicationContext
             Native.GetWindowRect(playerWnd, out pr);
             bool responding = false;
             try { responding = proc.Responding; } catch { }
-            Log(string.Format("Status 3 s after attach: visible={0}, parent={1}, rect=({2},{3})-({4},{5}), suspended={6}, responding={7}, foreground class={8}",
+            Log(string.Format("Status 3 s after attach: visible={0}, parent={1}, rect=({2},{3})-({4},{5}), responding={6}, foreground class={7}",
                 Native.IsWindowVisible(playerWnd), Native.ClassOf(Native.GetParent(playerWnd)), pr.L, pr.T, pr.R, pr.B,
-                suspended, responding, Native.ClassOf(Native.GetForegroundWindow())));
+                responding, Native.ClassOf(Native.GetForegroundWindow())));
         }
+
         if (attached && activeMode == 2 && playerWnd != IntPtr.Zero && WorkerAboveMe(progmanWnd, playerWnd))
         {
             Log("WorkerW moved above the player; fixing z-order");
             ZFix(progmanWnd, defViewWnd, playerWnd);
         }
-        ApplyPause();
-    }
-
-    void ApplyPause()
-    {
-        if (!attached || proc == null || proc.HasExited) return;
-        bool want = userPaused || (autoPause && DesktopCovered());
-        if (want == suspended) return;
-        try
-        {
-            if (want) Native.NtSuspendProcess(proc.Handle);
-            else Native.NtResumeProcess(proc.Handle);
-            suspended = want;
-            Log((want ? "Suspended ffplay" : "Resumed ffplay") + " (foreground class: " + Native.ClassOf(Native.GetForegroundWindow()) + ")");
-        }
-        catch { }
     }
 
     static bool DesktopCovered()
