@@ -30,9 +30,9 @@ VidPaper lives in the system tray (it may be under the `^` overflow arrow). Doub
 | Item | What it does |
 | --- | --- |
 | Choose video... | Pick a new wallpaper |
-| Pause | Freeze the video |
+| Pause (show normal wallpaper) | Stop the video and show your normal wallpaper until you untick it |
 | Alternate desktop mode | Use the other attach method (try this if nothing shows) |
-| Pause when a window covers the desktop | Saves CPU/battery while the wallpaper is hidden |
+| Pause when a window covers the desktop | Stops the video while the wallpaper is hidden, restarts it when it is visible again. Saves CPU/battery |
 | Renderer | SDL renderer used by `ffplay`. `direct3d11` is the default and the one that works on newer Windows 11 |
 | Run at Windows startup | Adds/removes a `Run` registry entry for the current user |
 | Open log | Opens `%APPDATA%\VidPaper\log.txt` |
@@ -66,6 +66,7 @@ ffmpeg -i input.webm -vf "scale=1920:1080:force_original_aspect_ratio=increase,c
 - Tested on Windows 11(24H2+) and Windows 10.
 - Primary monitor only.
 - No audio.
+- Pausing stops `ffplay` and starting again restarts the video from the beginning.
 - Wallpaper changes made through Windows Settings are not touched; exiting VidPaper brings your normal wallpaper back.
 
 To remove VidPaper: choose Exit, untick **Run at Windows startup**, then delete `VidPaper.exe` and `%APPDATA%\VidPaper`.
