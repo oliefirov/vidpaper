@@ -31,6 +31,9 @@ static class Native
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
+    public delegate void WinEventProc(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
+    [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr mod, WinEventProc proc, uint pid, uint tid, uint flags);
+    [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hook);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int L, T, R, B; }
@@ -53,10 +56,11 @@ static class Program
         {
             if (!first) return;
 
-            string ffplay = FindFfplay();
-            if (ffplay == null)
+            string ffplay = FindTool("ffplay.exe");
+            string ffmpeg = FindTool("ffmpeg.exe");
+            if (ffplay == null || ffmpeg == null)
             {
-                MessageBox.Show("ffplay.exe was not found.\nPut it next to VidPaper.exe or add FFmpeg's bin folder to PATH.",
+                MessageBox.Show("ffmpeg.exe and ffplay.exe were not both found.\nPut them next to VidPaper.exe or add FFmpeg's bin folder to PATH.",
                                 "VidPaper", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
@@ -66,7 +70,7 @@ static class Program
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e) { CrashLog(e.Exception); };
             AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { CrashLog(e.ExceptionObject); };
-            Application.Run(new App(ffplay));
+            Application.Run(new App(ffplay, ffmpeg));
         }
     }
 
@@ -81,9 +85,9 @@ static class Program
         catch { }
     }
 
-    static string FindFfplay()
+    static string FindTool(string name)
     {
-        string local = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ffplay.exe");
+        string local = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, name);
         if (File.Exists(local)) return local;
 
         string path = Environment.GetEnvironmentVariable("PATH") ?? "";
@@ -91,7 +95,7 @@ static class Program
         {
             try
             {
-                string p = Path.Combine(dir.Trim().Trim('"'), "ffplay.exe");
+                string p = Path.Combine(dir.Trim().Trim('"'), name);
                 if (File.Exists(p)) return p;
             }
             catch { }
@@ -111,7 +115,7 @@ class App : ApplicationContext
     static readonly IntPtr HWND_BOTTOM = (IntPtr)1;
     static readonly object logLock = new object();
 
-    readonly string ffplay;
+    readonly string ffplay, ffmpeg;
     readonly string configFile, settingsFile, logFile;
     readonly NotifyIcon tray = new NotifyIcon();
     readonly Timer attachTimer = new Timer();
@@ -120,24 +124,29 @@ class App : ApplicationContext
     string renderer = "";
     bool autoPause = true, postLogged;
     int ffLines;
-    DateTime attachedAt, stoppedAt;
+    DateTime attachedAt;
+    Native.WinEventProc winEventProc;
+    IntPtr winHook;
+    System.Threading.ManualResetEvent gate;
+    bool paused;
 
-    Process proc;
+    Process proc, feeder;
     string video;
     bool attached, userPaused, alt;
-    int tries, fails, activeMode;
-    IntPtr playerWnd, progmanWnd, defViewWnd;
+    int tries, fails, activeMode, zRepairs;
+    IntPtr playerWnd;
 
-    public App(string ffplayPath)
+    public App(string ffplayPath, string ffmpegPath)
     {
         ffplay = ffplayPath;
+        ffmpeg = ffmpegPath;
         string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VidPaper");
         Directory.CreateDirectory(dir);
         configFile = Path.Combine(dir, "video.txt");
         settingsFile = Path.Combine(dir, "settings.ini");
         logFile = Path.Combine(dir, "log.txt");
         try { if (File.Exists(logFile) && new FileInfo(logFile).Length > 200000) File.WriteAllText(logFile, ""); } catch { }
-        Log("---- VidPaper started. ffplay: " + ffplay);
+        Log("---- VidPaper started. ffplay: " + ffplay + ", ffmpeg: " + ffmpeg);
 
         alt = GetSetting("alt", "0") == "1";
         autoPause = GetSetting("autopause", "1") == "1";
@@ -145,7 +154,7 @@ class App : ApplicationContext
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("Choose video...", null, delegate { Choose(); });
-        pauseItem = new ToolStripMenuItem("Pause (show normal wallpaper)", null, delegate
+        pauseItem = new ToolStripMenuItem("Pause", null, delegate
         {
             userPaused = !userPaused;
             pauseItem.Checked = userPaused;
@@ -213,9 +222,11 @@ class App : ApplicationContext
 
         attachTimer.Interval = 100;
         attachTimer.Tick += TryAttach;
-        watchTimer.Interval = 1000;
+        watchTimer.Interval = 500;
         watchTimer.Tick += Watch;
         watchTimer.Start();
+        winEventProc = delegate(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time) { Watch(null, null); };
+        winHook = Native.SetWinEventHook(0x0003, 0x0017, IntPtr.Zero, winEventProc, 0, 0, 0);
 
         string saved = null;
         try { if (File.Exists(configFile)) saved = File.ReadAllText(configFile).Trim(); } catch { }
@@ -296,6 +307,7 @@ class App : ApplicationContext
     void Quit()
     {
         watchTimer.Stop();
+        if (winHook != IntPtr.Zero) Native.UnhookWinEvent(winHook);
         video = null;
         Kill();
         tray.Visible = false;
@@ -308,52 +320,105 @@ class App : ApplicationContext
         Kill();
         if (!File.Exists(path)) { Log("File not found: " + path); return; }
         video = path;
-        if (IsPaused()) { Log("Paused: ffplay will start when playback resumes"); return; }
 
         Rectangle b = Screen.PrimaryScreen.Bounds;
-        string args = string.Format(
-            "-loglevel warning -nostats -an -sn -noborder -loop 0 -framedrop -left 30000 -top 30000 " +
+        string playArgs = string.Format(
+            "-loglevel warning -nostats -an -sn -noborder -framedrop -left 30000 -top 30000 " +
             "-x {0} -y {1} -window_title {2} " +
-            "-vf \"scale={0}:{1}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop={0}:{1}\" -i \"{3}\"",
-            b.Width, b.Height, Title, path);
-        Log("Starting: ffplay " + args);
+            "-vf \"scale={0}:{1}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop={0}:{1}\" -i pipe:0",
+            b.Width, b.Height, Title);
 
-        var psi = new ProcessStartInfo(ffplay, args);
-        psi.UseShellExecute = false;
-        psi.CreateNoWindow = true;
-        psi.RedirectStandardError = true;
-        if (renderer != "") psi.EnvironmentVariables["SDL_RENDER_DRIVER"] = renderer;
+        bool gif = path.EndsWith(".gif", StringComparison.OrdinalIgnoreCase);
+        string codec = gif ? "-vf format=yuvj420p -c:v mjpeg -q:v 2" : "-c:v copy";
+        string feedArgs = string.Format(
+            "-hide_banner -loglevel error -nostdin -stream_loop -1 -i \"{0}\" -map 0:v:0 {1} -an -sn -dn -f matroska -",
+            path, codec);
+        Log("Starting: ffmpeg " + feedArgs);
+        Log("      |   ffplay " + playArgs);
+
+        var psiPlay = new ProcessStartInfo(ffplay, playArgs);
+        psiPlay.UseShellExecute = false;
+        psiPlay.CreateNoWindow = true;
+        psiPlay.RedirectStandardInput = true;
+        psiPlay.RedirectStandardError = true;
+        if (renderer != "") psiPlay.EnvironmentVariables["SDL_RENDER_DRIVER"] = renderer;
         Log("SDL renderer: " + (renderer == "" ? "default" : renderer));
+
+        var psiFeed = new ProcessStartInfo(ffmpeg, feedArgs);
+        psiFeed.UseShellExecute = false;
+        psiFeed.CreateNoWindow = true;
+        psiFeed.RedirectStandardOutput = true;
+        psiFeed.RedirectStandardError = true;
+
         ffLines = 0;
         try
         {
-            proc = Process.Start(psi);
+            proc = Process.Start(psiPlay);
+            feeder = Process.Start(psiFeed);
             proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
             {
                 if (e.Data != null && ++ffLines <= 80) Log("ffplay: " + e.Data);
             };
+            feeder.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (e.Data != null && ++ffLines <= 80) Log("ffmpeg: " + e.Data);
+            };
             proc.BeginErrorReadLine();
+            feeder.BeginErrorReadLine();
             try { proc.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
+            try { feeder.PriorityClass = ProcessPriorityClass.BelowNormal; } catch { }
+
+            gate = new System.Threading.ManualResetEvent(true);
+            System.Threading.ManualResetEvent g = gate;
+            Stream inStream = feeder.StandardOutput.BaseStream;
+            Stream outStream = proc.StandardInput.BaseStream;
+            var pump = new System.Threading.Thread(delegate() { Pump(inStream, outStream, g); });
+            pump.IsBackground = true;
+            pump.Start();
         }
         catch (Exception ex)
         {
-            Log("Could not start ffplay: " + ex.Message);
-            MessageBox.Show("Could not start ffplay:\n" + ex.Message, "VidPaper");
+            Log("Could not start ffmpeg/ffplay: " + ex.Message);
+            Kill();
             video = null;
+            MessageBox.Show("Could not start ffmpeg/ffplay:\n" + ex.Message, "VidPaper");
             return;
         }
         attached = false;
+        paused = false;
         tries = 0;
         attachTimer.Start();
+    }
+
+    static void Pump(Stream src, Stream dst, System.Threading.ManualResetEvent gate)
+    {
+        byte[] buf = new byte[65536];
+        try
+        {
+            int n;
+            while ((n = src.Read(buf, 0, buf.Length)) > 0)
+            {
+                gate.WaitOne();
+                dst.Write(buf, 0, n);
+                dst.Flush();
+            }
+        }
+        catch { }
+        try { dst.Close(); } catch { }
     }
 
     void Kill()
     {
         attachTimer.Stop();
         attached = false;
+        paused = false;
         playerWnd = IntPtr.Zero;
+        if (gate != null) gate.Set();
+        try { if (feeder != null && !feeder.HasExited) feeder.Kill(); } catch { }
         try { if (proc != null && !proc.HasExited) proc.Kill(); } catch { }
+        feeder = null;
         proc = null;
+        gate = null;
     }
 
     void TryAttach(object sender, EventArgs e)
@@ -430,20 +495,21 @@ class App : ApplicationContext
             Native.SetWindowLong(hw, -20, ex | 0x00080000 | 0x00000020 | 0x08000000 | 0x00000080);
             Native.SetLayeredWindowAttributes(hw, 0, 255, 2);
             Native.SetParent(hw, progman);
-            ZFix(progman, defView, hw);
+            ZFix(progman, hw);
             Native.SetWindowPos(hw, IntPtr.Zero, x, y, b.Width, b.Height, 0x0004 | 0x0010 | 0x0040 | 0x0020);
         }
 
         playerWnd = hw;
-        progmanWnd = progman;
-        defViewWnd = defView;
         activeMode = mode;
+        zRepairs = 0;
 
         Native.RECT r;
         Native.GetWindowRect(hw, out r);
-        Log(string.Format("Attached. parent now {0} ({1}), visible={2}, rect=({3},{4})-({5},{6}), WorkerW above player: {7}",
+        string zdump = "";
+        bool zok = mode != 2 || ZOrderOk(progman, hw, out zdump);
+        Log(string.Format("Attached. parent now {0} ({1}), visible={2}, rect=({3},{4})-({5},{6}), z-order ok: {7} [{8}]",
             Native.GetParent(hw), Native.ClassOf(Native.GetParent(hw)), Native.IsWindowVisible(hw),
-            r.L, r.T, r.R, r.B, mode == 2 && WorkerAboveMe(progman, hw)));
+            r.L, r.T, r.R, r.B, zok, zdump));
     }
 
     static void SetChildStyle(IntPtr hw)
@@ -453,22 +519,33 @@ class App : ApplicationContext
         Native.SetWindowLong(hw, -16, style);
     }
 
-    static void ZFix(IntPtr progman, IntPtr defView, IntPtr hw)
+    static void ZFix(IntPtr progman, IntPtr hw)
     {
         const uint f = 0x0002 | 0x0001 | 0x0010;
+        IntPtr defView = Native.FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
         if (defView != IntPtr.Zero) Native.SetWindowPos(hw, defView, 0, 0, 0, 0, f);
         IntPtr w = Native.FindWindowEx(progman, IntPtr.Zero, "WorkerW", null);
         if (w != IntPtr.Zero) Native.SetWindowPos(w, hw, 0, 0, 0, 0, f);
     }
 
-    static bool WorkerAboveMe(IntPtr progman, IntPtr me)
+    static bool ZOrderOk(IntPtr progman, IntPtr me, out string dump)
     {
+        int index = 0, iDef = -1, iMe = -1, iWorker = -1;
+        var sb = new StringBuilder();
         for (IntPtr w = Native.GetWindow(progman, 5); w != IntPtr.Zero; w = Native.GetWindow(w, 2))
         {
-            if (w == me) return false;
-            if (Native.ClassOf(w) == "WorkerW") return true;
+            string c = Native.ClassOf(w);
+            sb.Append(w == me ? "PLAYER" : c).Append(" > ");
+            if (w == me) iMe = index;
+            else if (c == "SHELLDLL_DefView" && iDef < 0) iDef = index;
+            else if (c == "WorkerW" && iWorker < 0) iWorker = index;
+            index++;
         }
-        return false;
+        dump = sb.ToString();
+        if (iMe < 0) return true;
+        if (iDef >= 0 && iDef > iMe) return false;
+        if (iWorker >= 0 && iWorker < iMe) return false;
+        return true;
     }
 
     bool IsPaused()
@@ -478,57 +555,65 @@ class App : ApplicationContext
 
     void Watch(object sender, EventArgs e)
     {
-        if (video == null) return;
-
-        if (IsPaused())
+        try
         {
-            if (proc != null)
+            if (video == null || proc == null || feeder == null) return;
+
+            if (proc.HasExited || feeder.HasExited)
             {
-                Log("Paused: stopping ffplay (foreground class: " + Native.ClassOf(Native.GetForegroundWindow()) + ")");
-                Kill();
-                stoppedAt = DateTime.Now;
+                int c1 = -1, c2 = -1;
+                try { c1 = proc.ExitCode; } catch { }
+                try { c2 = feeder.ExitCode; } catch { }
+                Log(string.Format("Playback stopped: ffplay exited={0} (code {1}), ffmpeg exited={2} (code {3}), attempt {4}",
+                    proc.HasExited, c1, feeder.HasExited, c2, fails + 1));
+                if (++fails <= 3) Play(video);
+                else
+                {
+                    Balloon("ffmpeg/ffplay keep exiting. Try the file in CMD, and see the log.");
+                    video = null;
+                    Kill();
+                }
+                return;
             }
-            return;
-        }
 
-        if (proc == null)
-        {
-            if ((DateTime.Now - stoppedAt).TotalSeconds < 2) return;
-            Log("Resumed: starting ffplay");
-            Play(video);
-            return;
-        }
-
-        if (proc.HasExited)
-        {
-            int code = -1;
-            try { code = proc.ExitCode; } catch { }
-            Log("ffplay is not running (exit code " + code + "), attempt " + (fails + 1));
-            if (++fails <= 3) Play(video);
-            else
+            bool wantPause = attached && IsPaused();
+            if (wantPause != paused)
             {
-                Balloon("ffplay keeps exiting (code " + code + "). Try the file in CMD, and see the log.");
-                video = null;
+                paused = wantPause;
+                if (gate != null)
+                {
+                    if (paused) gate.Reset();
+                    else gate.Set();
+                }
+                Log(paused ? "Paused (video data stopped, last frame stays)" : "Resumed");
             }
-            return;
-        }
 
-        if (attached && !postLogged && (DateTime.Now - attachedAt).TotalSeconds >= 3 && playerWnd != IntPtr.Zero)
-        {
-            postLogged = true;
-            Native.RECT pr;
-            Native.GetWindowRect(playerWnd, out pr);
-            bool responding = false;
-            try { responding = proc.Responding; } catch { }
-            Log(string.Format("Status 3 s after attach: visible={0}, parent={1}, rect=({2},{3})-({4},{5}), responding={6}, foreground class={7}",
-                Native.IsWindowVisible(playerWnd), Native.ClassOf(Native.GetParent(playerWnd)), pr.L, pr.T, pr.R, pr.B,
-                responding, Native.ClassOf(Native.GetForegroundWindow())));
-        }
+            if (attached && !postLogged && (DateTime.Now - attachedAt).TotalSeconds >= 3 && playerWnd != IntPtr.Zero)
+            {
+                postLogged = true;
+                Native.RECT pr;
+                Native.GetWindowRect(playerWnd, out pr);
+                bool responding = false;
+                try { responding = proc.Responding; } catch { }
+                Log(string.Format("Status 3 s after attach: visible={0}, parent={1}, rect=({2},{3})-({4},{5}), responding={6}, foreground class={7}",
+                    Native.IsWindowVisible(playerWnd), Native.ClassOf(Native.GetParent(playerWnd)), pr.L, pr.T, pr.R, pr.B,
+                    responding, Native.ClassOf(Native.GetForegroundWindow())));
+            }
 
-        if (attached && activeMode == 2 && playerWnd != IntPtr.Zero && WorkerAboveMe(progmanWnd, playerWnd))
+            if (attached && activeMode == 2 && playerWnd != IntPtr.Zero)
+            {
+                IntPtr pm = Native.FindWindow("Progman", null);
+                string dump;
+                if (pm != IntPtr.Zero && pm == Native.GetParent(playerWnd) && !ZOrderOk(pm, playerWnd, out dump))
+                {
+                    if (zRepairs++ < 20) Log("Z-order was wrong, repairing: " + dump);
+                    ZFix(pm, playerWnd);
+                }
+            }
+        }
+        catch (Exception ex)
         {
-            Log("WorkerW moved above the player; fixing z-order");
-            ZFix(progmanWnd, defViewWnd, playerWnd);
+            Log("Watch error: " + ex.Message);
         }
     }
 
